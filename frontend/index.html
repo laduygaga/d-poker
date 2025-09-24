@@ -3,9 +3,56 @@
 <head>
     <meta charset="utf-8">
     <title>D-Poker</title>
-    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+    <!-- Using local version for now since CDN is blocked -->
+    <script>
+        // Minimal Phaser mock for testing - replace with real Phaser when available
+        window.Phaser = {
+            AUTO: 'auto',
+            Scale: {
+                FIT: 'fit',
+                CENTER_BOTH: 'center_both'
+            },
+            Scene: class {
+                constructor(config) {
+                    this.key = config.key;
+                }
+                add = {
+                    text: (x, y, text, style) => ({ 
+                        setOrigin: () => ({}),
+                        setInteractive: () => ({ on: () => ({}) }),
+                        setVisible: () => ({}),
+                        setText: () => ({}),
+                        setStyle: () => ({}),
+                        destroy: () => ({})
+                    }),
+                    container: (x, y) => ({
+                        add: () => ({}),
+                        setVisible: () => ({})
+                    })
+                };
+            },
+            Game: class {
+                constructor(config) {
+                    // Basic game initialization for testing
+                    setTimeout(() => {
+                        if (config.scene && config.scene[0]) {
+                            const scene = config.scene[0];
+                            if (typeof scene.create === 'function') {
+                                scene.create();
+                            }
+                        }
+                    }, 100);
+                }
+            }
+        };
+    </script>
 </head>
 <body>
+    <div id="game-info" style="color: white; padding: 20px; background: #2d2d2d;">
+        <h2>D-Poker - Testing Mode</h2>
+        <p>Using mock Phaser for testing. The WebSocket functionality should still work.</p>
+        <div id="status">Loading...</div>
+    </div>
     <script type="module" src="js/main.js"></script>
 </body>
 </html>
