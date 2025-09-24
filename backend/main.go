@@ -133,37 +133,67 @@ func (h *Hub) removePlayer(playerID string) {
 // **** HÀM ĐƯỢC CẬP NHẬT LOGIC ****
 func (h *Hub) handlePlayerReady(playerID string, isReady bool) {
 	h.gameStateMutex.Lock()
-	defer h.gameStateMutex.Unlock()
+	// Note: We'll release the lock before broadcasting to avoid deadlock
+
+	log.Printf("Player %s ready state change: %v", playerID, isReady)
 
 	if player, ok := h.gameState.Players[playerID]; ok {
 		player.IsReady = isReady
 		h.gameState.Players[playerID] = player
+		log.Printf("Player %s ready state updated in game state: %v", playerID, isReady)
+	} else {
+		log.Printf("Warning: Player %s not found in game state", playerID)
+		h.gameStateMutex.Unlock() // Release lock before returning
+		return
 	}
 
 	// Logic kiểm tra bắt đầu game đã được làm rõ
 	if !h.gameState.GameStarted {
+		log.Println("Game not started, checking if conditions met to start...")
+		
 		activePlayers := make(map[string]Player)
 		for id, p := range h.gameState.Players {
 			if p.Chips > 0 {
 				activePlayers[id] = p
+				log.Printf("Active player: %s, chips: %d, ready: %v", id, p.Chips, p.IsReady)
 			}
 		}
+
+		log.Printf("Total active players with chips > 0: %d", len(activePlayers))
 
 		if len(activePlayers) >= 2 {
 			allActivePlayersReady := true
-			for _, p := range activePlayers {
-				if !p.IsReady {
+			readyCount := 0
+			for id, p := range activePlayers {
+				if p.IsReady {
+					readyCount++
+				} else {
 					allActivePlayersReady = false
-					break
+					log.Printf("Player %s is NOT ready", id)
 				}
 			}
+			
+			log.Printf("Ready players: %d/%d", readyCount, len(activePlayers))
 
 			if allActivePlayersReady {
+				log.Println("All active players are ready! Starting game...")
 				h.startGameUnsafe(activePlayers)
+			} else {
+				log.Println("Not all active players are ready yet")
 			}
+		} else {
+			log.Printf("Need at least 2 active players to start, currently have %d", len(activePlayers))
 		}
+	} else {
+		log.Println("Game already started, ignoring ready state change")
 	}
+	
+	// Release the write lock BEFORE calling broadcastGameState to avoid deadlock
+	h.gameStateMutex.Unlock()
+	
+	log.Println("About to broadcast game state after ready change")
 	h.broadcastGameState()
+	log.Println("Finished broadcasting game state after ready change")
 }
 
 func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
@@ -221,6 +251,8 @@ func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
 	h.gameState.LastBet = BigBlindAmt
 	h.gameState.CurrentTurnIndex = (bbIndex + 1) % numPlayers
 	log.Printf("First turn is %s", h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex])
+	
+	log.Println("Game started successfully - broadcasting updated state")
 }
 
 func (h *Hub) handleBetUnsafe(playerID string, amount int) {
@@ -441,6 +473,9 @@ func (h *Hub) endGameUnsafe(reason string) {
 func (h *Hub) broadcastGameState() {
 	h.gameStateMutex.RLock()
 	defer h.gameStateMutex.RUnlock()
+	
+	log.Printf("Broadcasting game state to %d clients", len(h.clients))
+	
 	payload, err := json.Marshal(h.gameState)
 	if err != nil {
 		log.Printf("Error marshalling state: %v", err)
@@ -453,11 +488,12 @@ func (h *Hub) broadcastGameState() {
 		return
 	}
 
-	for _, client := range h.clients {
+	for clientID, client := range h.clients {
 		select {
 		case client.send <- msg:
+			log.Printf("Game state sent to client %s", clientID)
 		default:
-			log.Printf("Client %s send channel full. Skipping.", client.ID)
+			log.Printf("Client %s send channel full. Skipping.", clientID)
 		}
 	}
 }
@@ -483,11 +519,16 @@ func (c *Client) readPump() {
 
 		switch msg.Type {
 		case "player_ready":
+			log.Printf("Received player_ready message from %s", c.ID)
 			var payload struct{ IsReady bool `json:"isReady"` }
 			if json.Unmarshal(msg.Payload, &payload) == nil {
+				log.Printf("Parsed ready state: %v for player %s", payload.IsReady, c.ID)
 				c.hub.handlePlayerReady(c.ID, payload.IsReady)
+			} else {
+				log.Printf("Failed to parse player_ready payload for %s", c.ID)
 			}
 		case "player_action":
+			log.Printf("Received player_action message from %s", c.ID)
 			c.hub.handlePlayerAction(c.ID, msg.Payload)
 		}
 	}

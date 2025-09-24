@@ -11,6 +11,7 @@ class GameScene extends Phaser.Scene {
     create() {
         this.add.text(400, 30, 'D-Poker', { fontSize: '40px', fill: '#fff' }).setOrigin(0.5);
         this.statusText = this.add.text(400, 70, 'Connecting...', { fontSize: '24px', fill: '#fff' }).setOrigin(0.5);
+        this.readyStatusText = this.add.text(400, 100, 'Players ready: 0/0', { fontSize: '18px', fill: '#ccc' }).setOrigin(0.5);
         this.potText = this.add.text(400, 280, 'Pot: 0', { fontSize: '28px', fill: '#ffc300' }).setOrigin(0.5);
         this.communityCardContainer = this.add.container(400, 220);
 
@@ -23,6 +24,7 @@ class GameScene extends Phaser.Scene {
         this.readyButton.on('pointerdown', () => {
             this.isReady = !this.isReady;
             this.updateReadyButton();
+            console.log(`Sending ready state: ${this.isReady} for player ${this.myId}`);
             this.socket.send(JSON.stringify({ type: 'player_ready', payload: { isReady: this.isReady } }));
         });
         
@@ -59,12 +61,15 @@ class GameScene extends Phaser.Scene {
 
         this.socket.onmessage = (event) => {
             const message = JSON.parse(event.data);
+            console.log('Received message:', message.type, message.payload);
             switch (message.type) {
                 case 'your_id':
                     this.myId = message.payload.id;
+                    console.log(`My player ID: ${this.myId}`);
                     break;
                 case 'game_state':
                     this.gameState = message.payload; // Lưu lại state để tham chiếu
+                    console.log('Game state updated:', this.gameState);
                     this.updateGameState(this.gameState);
                     break;
             }
@@ -86,6 +91,26 @@ class GameScene extends Phaser.Scene {
         if (state.gameStarted && this.isReady) {
             this.isReady = false;
             this.updateReadyButton();
+        }
+        
+        // Update ready status display
+        const allPlayers = Object.values(state.players);
+        const activePlayers = allPlayers.filter(p => p.chips > 0);
+        const readyPlayers = activePlayers.filter(p => p.isReady);
+        
+        if (state.gameStarted) {
+            this.readyStatusText.setText('Game in progress');
+        } else if (activePlayers.length < 2) {
+            this.readyStatusText.setText('Waiting for more players...');
+        } else {
+            const statusColor = readyPlayers.length === activePlayers.length ? '#0f0' : '#ccc';
+            this.readyStatusText.setText(`Players ready: ${readyPlayers.length}/${activePlayers.length}`);
+            this.readyStatusText.setStyle({ fill: statusColor });
+            
+            // Show encouraging message when close to starting
+            if (readyPlayers.length === activePlayers.length - 1 && activePlayers.length >= 2) {
+                this.readyStatusText.setText(`Players ready: ${readyPlayers.length}/${activePlayers.length} - Waiting for 1 more!`);
+            }
         }
         
         this.potText.setText(`Pot: ${state.pot || 0}`);

@@ -6,6 +6,7 @@
 *.dylib
 d-poker
 backend/d-poker
+server
 
 # Node.js dependencies
 /node_modules
