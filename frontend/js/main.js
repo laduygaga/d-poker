@@ -14,6 +14,17 @@ class GameScene extends Phaser.Scene {
         this.potText = this.add.text(400, 280, 'Pot: 0', { fontSize: '28px', fill: '#ffc300' }).setOrigin(0.5);
         this.communityCardContainer = this.add.container(400, 220);
 
+        // --- New Game Result Text ---
+        // This will display the winner and is hidden by default.
+        this.gameResultText = this.add.text(400, 350, '', {
+            fontSize: '32px',
+            fill: '#00ff00',
+            backgroundColor: 'rgba(0,0,0,0.7)',
+            padding: { x: 20, y: 10 },
+            align: 'center'
+        }).setOrigin(0.5).setDepth(100).setVisible(false);
+
+
         // --- Ready Button ---
         this.readyButton = this.add.text(700, 550, 'Ready', {
             fontSize: '28px', fill: '#0f0', backgroundColor: '#555',
@@ -21,11 +32,8 @@ class GameScene extends Phaser.Scene {
         }).setOrigin(0.5).setInteractive();
 
         this.readyButton.on('pointerdown', () => {
-            // 1. Toggle the local state for instant feedback
             this.isReady = !this.isReady;
-            // 2. Update the button's appearance immediately
             this.updateReadyButton();
-            // 3. Send the updated state to the server
             this.socket.send(JSON.stringify({ type: 'player_ready', payload: { isReady: this.isReady } }));
         });
         
@@ -45,10 +53,12 @@ class GameScene extends Phaser.Scene {
         });
         raiseButton.on('pointerdown', () => {
             const me = this.gameState.players[this.myId];
-            const minRaise = this.gameState.lastBet * 2;
+            const minRaise = this.gameState.lastBet * 2 || 20; // Default to Big Blind if no bet
             const raiseAmount = parseInt(prompt(`Raise amount (min ${minRaise}):`, minRaise), 10);
-             if (!isNaN(raiseAmount) && raiseAmount >= me.bet + this.gameState.lastBet) {
+            if (!isNaN(raiseAmount) && raiseAmount >= minRaise && raiseAmount <= me.chips) {
                 this.sendPlayerAction('raise', { amount: raiseAmount });
+            } else {
+                alert(`Invalid raise amount. Must be between ${minRaise} and your chip count of ${me.chips}.`);
             }
         });
         this.callButton = callButton;
@@ -85,7 +95,6 @@ class GameScene extends Phaser.Scene {
     }
 
     updateGameState(state) {
-        // Synchronize local isReady flag from the new playerReady map
         if (state.playerReady) {
             this.isReady = state.playerReady[this.myId] || false;
         }
@@ -142,7 +151,19 @@ class GameScene extends Phaser.Scene {
         });
         
         const myTurn = state.gameStarted && state.playerOrder && state.playerOrder[state.currentTurnIndex] === this.myId;
-        this.actionContainer.setVisible(myTurn);
+        
+        // --- Game Phase Logic ---
+        if (state.gamePhase === 'showdown') {
+            this.actionContainer.setVisible(false);
+            this.gameResultText.setText(state.winningHandDesc || 'Showdown!');
+            this.gameResultText.setVisible(true);
+        } else {
+            // Hide result text if not in showdown
+            this.gameResultText.setVisible(false);
+            // Show actions only if it's my turn
+            this.actionContainer.setVisible(myTurn);
+        }
+
         if(myTurn) {
             const me = state.players[this.myId];
             if (me.bet >= state.lastBet) {
@@ -167,7 +188,7 @@ class GameScene extends Phaser.Scene {
                 if (pIndex === (state.dealerIndex + 1) % state.playerOrder.length) statusIcons += ' (SB)';
                 if (pIndex === (state.dealerIndex + 2) % state.playerOrder.length) statusIcons += ' (BB)';
             }
-        } else if (state.playerReady && state.playerReady[playerId]) { // Use the new map
+        } else if (state.playerReady && state.playerReady[playerId]) {
              statusIcons += ' (Ready)';
         }
         
