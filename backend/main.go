@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid" // <-- THÊM DÒNG NÀY
 	"github.com/gorilla/websocket"
 )
 
@@ -358,7 +359,6 @@ func (h *Hub) startNextPhaseUnsafe() {
 	lastPlayerIndex := -1
 
 	if len(h.gameState.PlayerOrder) > 0 {
-		// Find first player to act (first active player after dealer)
 		for i := 1; i <= len(h.gameState.PlayerOrder); i++ {
 			idx := (h.gameState.DealerIndex + i) % len(h.gameState.PlayerOrder)
 			playerID := h.gameState.PlayerOrder[idx]
@@ -368,7 +368,6 @@ func (h *Hub) startNextPhaseUnsafe() {
 			}
 		}
 
-		// Find last player to act (last active player before dealer)
 		for i := 0; i < len(h.gameState.PlayerOrder); i++ {
 			idx := (h.gameState.DealerIndex - i + len(h.gameState.PlayerOrder)) % len(h.gameState.PlayerOrder)
 			playerID := h.gameState.PlayerOrder[idx]
@@ -514,7 +513,9 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	client := &Client{ID: conn.RemoteAddr().String(), hub: hub, conn: conn, send: make(chan []byte, 256)}
+	// *** SỬA ĐỔI CHÍNH Ở ĐÂY ***
+	// Thay vì dùng địa chỉ IP, chúng ta tạo một ID duy nhất
+	client := &Client{ID: uuid.New().String(), hub: hub, conn: conn, send: make(chan []byte, 256)}
 	hub.register <- client
 	idPayload, _ := json.Marshal(map[string]string{"id": client.ID})
 	msg, _ := json.Marshal(Message{Type: "your_id", Payload: idPayload})
