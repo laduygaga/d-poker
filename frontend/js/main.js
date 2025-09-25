@@ -1,11 +1,11 @@
 class GameScene extends Phaser.Scene {
     constructor() {
         super({ key: 'GameScene' });
-        this.playerObjects = {}; // Lưu trữ các đối tượng game của người chơi
-        this.communityCardObjects = []; // Lưu các lá bài chung
-        this.isReady = false;
-        this.myId = null; // ID của client này
-        this.gameState = {}; // Giữ trạng thái game mới nhất
+        this.playerObjects = {}; // Stores game objects for players
+        this.communityCardObjects = []; // Stores community card objects
+        this.isReady = false; // Local flag for immediate UI feedback
+        this.myId = null; // ID for this client
+        this.gameState = {}; // Holds the latest game state from the server
     }
 
     create() {
@@ -14,26 +14,29 @@ class GameScene extends Phaser.Scene {
         this.potText = this.add.text(400, 280, 'Pot: 0', { fontSize: '28px', fill: '#ffc300' }).setOrigin(0.5);
         this.communityCardContainer = this.add.container(400, 220);
 
-        // --- Nút Ready ---
+        // --- Ready Button ---
         this.readyButton = this.add.text(700, 550, 'Ready', {
             fontSize: '28px', fill: '#0f0', backgroundColor: '#555',
             padding: { left: 15, right: 15, top: 10, bottom: 10 }
         }).setOrigin(0.5).setInteractive();
 
         this.readyButton.on('pointerdown', () => {
+            // 1. Toggle the local state for instant feedback
             this.isReady = !this.isReady;
+            // 2. Update the button's appearance immediately
             this.updateReadyButton();
+            // 3. Send the updated state to the server
             this.socket.send(JSON.stringify({ type: 'player_ready', payload: { isReady: this.isReady } }));
         });
         
-        // --- Các nút hành động trong game ---
+        // --- In-Game Action Buttons ---
         this.actionContainer = this.add.container(400, 550);
         const foldButton = this.add.text(-150, 0, 'Fold', { fontSize: '28px', fill: '#ff5733', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
         const callButton = this.add.text(0, 0, 'Call', { fontSize: '28px', fill: '#33ff57', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
         const raiseButton = this.add.text(150, 0, 'Raise', { fontSize: '28px', fill: '#3375ff', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
         
         this.actionContainer.add([foldButton, callButton, raiseButton]);
-        this.actionContainer.setVisible(false); // Ẩn đi lúc đầu
+        this.actionContainer.setVisible(false);
 
         foldButton.on('pointerdown', () => this.sendPlayerAction('fold'));
         callButton.on('pointerdown', () => {
@@ -51,7 +54,7 @@ class GameScene extends Phaser.Scene {
         this.callButton = callButton;
 
 
-        // --- Logic WebSocket ---
+        // --- WebSocket Logic ---
         this.socket = new WebSocket('ws://localhost:8080/ws');
         this.socket.onopen = () => this.statusText.setText('Connected!');
         this.socket.onerror = (error) => this.statusText.setText('Connection Error!');
@@ -64,7 +67,7 @@ class GameScene extends Phaser.Scene {
                     this.myId = message.payload.id;
                     break;
                 case 'game_state':
-                    this.gameState = message.payload; // Lưu lại state để tham chiếu
+                    this.gameState = message.payload;
                     this.updateGameState(this.gameState);
                     break;
             }
@@ -82,15 +85,16 @@ class GameScene extends Phaser.Scene {
     }
 
     updateGameState(state) {
-        this.readyButton.setVisible(!state.gameStarted);
-        if (state.gameStarted && this.isReady) {
-            this.isReady = false;
-            this.updateReadyButton();
+        // Synchronize local isReady flag from the new playerReady map
+        if (state.playerReady) {
+            this.isReady = state.playerReady[this.myId] || false;
         }
+
+        this.updateReadyButton();
+        this.readyButton.setVisible(!state.gameStarted);
         
         this.potText.setText(`Pot: ${state.pot || 0}`);
 
-        // Cập nhật bài chung
         this.communityCardObjects.forEach(card => card.destroy());
         this.communityCardObjects = [];
         if (state.communityCards) {
@@ -105,42 +109,38 @@ class GameScene extends Phaser.Scene {
             });
         }
 
-        const allPlayerIds = Object.keys(state.players);
+        const allPlayerIds = state.players ? Object.keys(state.players) : [];
 
-        // Xóa các đối tượng người chơi không còn trong state
         for (const existingId in this.playerObjects) {
             if (!allPlayerIds.includes(existingId)) {
                 this.playerObjects[existingId].destroy();
                 delete this.playerObjects[existingId];
             }
         }
-
-        // **** LOGIC HIỂN THỊ ĐÃ SỬA LỖI ****
+        
         const otherPlayerIds = allPlayerIds.filter(id => id !== this.myId);
         
-        // Vị trí hiển thị cố định
         const otherPositions = [
-            { x: 100, y: 250 }, // Trái
-            { x: 250, y: 100 }, // Trái trên
-            { x: 550, y: 100 }, // Phải trên
-            { x: 700, y: 250 }, // Phải
-            { x: 400, y: 400 }, // Đối diện (nếu > 5 người)
+            { x: 100, y: 250 }, { x: 250, y: 100 },
+            { x: 550, y: 100 }, { x: 700, y: 250 },
+            { x: 400, y: 400 },
         ];
-        const myPosition = { x: 400, y: 500 }; // Vị trí của mình
+        const myPosition = { x: 400, y: 500 };
 
-        // Hiển thị những người chơi khác
-        otherPlayerIds.forEach((playerId, index) => {
-            const player = state.players[playerId];
-            const pos = otherPositions[index];
+        allPlayerIds.forEach(id => {
+            const player = state.players[id];
+            if (!player.isConnected) {
+                if(this.playerObjects[id]) {
+                    this.playerObjects[id].destroy();
+                    delete this.playerObjects[id];
+                }
+                return;
+            }
+            const isMe = id === this.myId;
+            const pos = isMe ? myPosition : otherPositions[otherPlayerIds.indexOf(id)];
             this.renderPlayer(player, pos, state);
         });
-
-        // Hiển thị chính mình
-        if (state.players[this.myId]) {
-            this.renderPlayer(state.players[this.myId], myPosition, state);
-        }
         
-        // Hiển thị nút hành động nếu đến lượt
         const myTurn = state.gameStarted && state.playerOrder && state.playerOrder[state.currentTurnIndex] === this.myId;
         this.actionContainer.setVisible(myTurn);
         if(myTurn) {
@@ -167,7 +167,7 @@ class GameScene extends Phaser.Scene {
                 if (pIndex === (state.dealerIndex + 1) % state.playerOrder.length) statusIcons += ' (SB)';
                 if (pIndex === (state.dealerIndex + 2) % state.playerOrder.length) statusIcons += ' (BB)';
             }
-        } else if (player.isReady) {
+        } else if (state.playerReady && state.playerReady[playerId]) { // Use the new map
              statusIcons += ' (Ready)';
         }
         
@@ -188,13 +188,11 @@ class GameScene extends Phaser.Scene {
 
         playerObj.text.setStyle({ fill: isMyTurn ? '#ffff00' : '#fff' });
 
-        // Xóa bài cũ (nếu có)
         if (playerObj.cards) {
             playerObj.cards.forEach(c => c.destroy());
         }
         playerObj.cards = [];
 
-        // Vẽ bài mới
         if (player.hand && player.hand.length > 0) {
             player.hand.forEach((card, i) => {
                 const cardText = (player.id === this.myId || state.gamePhase === 'showdown') ? `${card.rank}${card.suit}` : '[]';

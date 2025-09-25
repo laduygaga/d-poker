@@ -30,6 +30,7 @@ type Hub struct {
 	clients        map[string]*Client
 	register       chan *Client
 	unregister     chan *Client
+	playerReady    map[string]bool // Track ready status separately
 	gameState      GameState
 	gameStateMutex sync.RWMutex
 }
@@ -41,16 +42,17 @@ type Card struct {
 }
 
 type Player struct {
-	ID       string `json:"id"`
-	IsReady  bool   `json:"isReady"`
-	Hand     []Card `json:"hand"`
-	Chips    int    `json:"chips"`
-	Bet      int    `json:"bet"`
-	IsInHand bool   `json:"isInHand"`
+	ID          string `json:"id"`
+	IsConnected bool   `json:"isConnected"`
+	Hand        []Card `json:"hand"`
+	Chips       int    `json:"chips"`
+	Bet         int    `json:"bet"`
+	IsInHand    bool   `json:"isInHand"`
 }
 
 type GameState struct {
 	Players          map[string]Player `json:"players"`
+	PlayerReady      map[string]bool   `json:"playerReady"`
 	GameStarted      bool              `json:"gameStarted"`
 	Deck             []Card            `json:"-"`
 	Pot              int               `json:"pot"`
@@ -70,11 +72,13 @@ type Message struct {
 // --- Khởi tạo Hub ---
 func newHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		clients:     make(map[string]*Client),
+		register:    make(chan *Client),
+		unregister:  make(chan *Client),
+		playerReady: make(map[string]bool),
 		gameState: GameState{
 			Players:        make(map[string]Player),
+			PlayerReady:    make(map[string]bool),
 			DealerIndex:    -1,
 			GamePhase:      "waiting",
 			CommunityCards: []Card{},
@@ -87,15 +91,15 @@ func (h *Hub) run() {
 		select {
 		case client := <-h.register:
 			h.clients[client.ID] = client
-			h.addPlayer(client.ID)
-			log.Printf("Client %s registered. Total: %d", client.ID, len(h.clients))
+			h.addOrUpdatePlayer(client.ID, true) // Mark as connected
+			log.Printf("Client %s registered. Total clients: %d", client.ID, len(h.clients))
 
 		case client := <-h.unregister:
 			if _, ok := h.clients[client.ID]; ok {
 				delete(h.clients, client.ID)
 				close(client.send)
-				h.removePlayer(client.ID)
-				log.Printf("Client %s unregistered. Total: %d", client.ID, len(h.clients))
+				h.addOrUpdatePlayer(client.ID, false) // Mark as disconnected
+				log.Printf("Client %s unregistered. Total clients: %d", client.ID, len(h.clients))
 			}
 		}
 	}
@@ -103,67 +107,72 @@ func (h *Hub) run() {
 
 // --- Logic Game ---
 
-func (h *Hub) addPlayer(playerID string) {
-	h.gameStateMutex.Lock()
-	h.gameState.Players[playerID] = Player{ID: playerID, Hand: []Card{}, Chips: StartingChips}
-	h.gameStateMutex.Unlock()
-	h.broadcastGameState()
-}
-
-func (h *Hub) removePlayer(playerID string) {
+func (h *Hub) addOrUpdatePlayer(playerID string, isConnected bool) {
 	h.gameStateMutex.Lock()
 	defer h.gameStateMutex.Unlock()
 
-	delete(h.gameState.Players, playerID)
-	// Nếu game đang diễn ra và số người chơi < 2, dừng game
-	if h.gameState.GameStarted {
-		activePlayers := 0
-		for _, p := range h.gameState.Players {
-			if p.IsInHand {
-				activePlayers++
-			}
-		}
-		if activePlayers < 2 {
-			h.endGameUnsafe("Not enough players")
-		}
+	player, exists := h.gameState.Players[playerID]
+	if !exists {
+		player = Player{ID: playerID, Hand: []Card{}, Chips: StartingChips}
+		h.playerReady[playerID] = false
+		log.Printf("Creating new player: %s", playerID)
 	}
-	h.broadcastGameState()
+	player.IsConnected = isConnected
+	h.gameState.Players[playerID] = player
+
+	if !isConnected && h.gameState.GameStarted {
+		player.IsInHand = false
+		h.gameState.Players[playerID] = player
+		log.Printf("Player %s disconnected mid-game, folding.", playerID)
+		h.advanceTurnUnsafe()
+	} else {
+		h.broadcastGameStateUnsafe()
+	}
 }
 
-// **** HÀM ĐƯỢC CẬP NHẬT LOGIC ****
 func (h *Hub) handlePlayerReady(playerID string, isReady bool) {
 	h.gameStateMutex.Lock()
 	defer h.gameStateMutex.Unlock()
 
-	if player, ok := h.gameState.Players[playerID]; ok {
-		player.IsReady = isReady
-		h.gameState.Players[playerID] = player
+	if _, ok := h.playerReady[playerID]; ok {
+		h.playerReady[playerID] = isReady
+		log.Printf("Player %s set IsReady to: %t", playerID, isReady)
 	}
 
-	// Logic kiểm tra bắt đầu game đã được làm rõ
-	if !h.gameState.GameStarted {
-		activePlayers := make(map[string]Player)
-		for id, p := range h.gameState.Players {
-			if p.Chips > 0 {
-				activePlayers[id] = p
-			}
-		}
+	if h.gameState.GameStarted {
+		h.broadcastGameStateUnsafe()
+		return
+	}
 
-		if len(activePlayers) >= 2 {
-			allActivePlayersReady := true
-			for _, p := range activePlayers {
-				if !p.IsReady {
-					allActivePlayersReady = false
-					break
-				}
-			}
-
-			if allActivePlayersReady {
-				h.startGameUnsafe(activePlayers)
-			}
+	eligiblePlayers := make(map[string]Player)
+	for id, p := range h.gameState.Players {
+		if p.IsConnected && p.Chips > 0 {
+			eligiblePlayers[id] = p
 		}
 	}
-	h.broadcastGameState()
+
+	if len(eligiblePlayers) < 2 {
+		log.Printf("Not enough eligible players to start. Have %d, need at least 2.", len(eligiblePlayers))
+		h.broadcastGameStateUnsafe()
+		return
+	}
+
+	allEligiblePlayersReady := true
+	for id := range eligiblePlayers {
+		if !h.playerReady[id] {
+			allEligiblePlayersReady = false
+			break
+		}
+	}
+
+	if allEligiblePlayersReady {
+		log.Printf("All %d eligible players are ready. Starting game.", len(eligiblePlayers))
+		h.startGameUnsafe(eligiblePlayers)
+	} else {
+		log.Println("Waiting for all eligible players to be ready.")
+	}
+
+	h.broadcastGameStateUnsafe()
 }
 
 func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
@@ -176,10 +185,14 @@ func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
 
 	h.gameState.PlayerOrder = make([]string, 0, len(activePlayers))
 	for id := range activePlayers {
-		p := h.gameState.Players[id] // Lấy player gốc từ gamestate
-		p.Hand, p.IsReady, p.Bet, p.IsInHand = []Card{}, false, 0, true
+		p := h.gameState.Players[id]
+		p.Hand, p.Bet, p.IsInHand = []Card{}, 0, true
 		h.gameState.Players[id] = p
 		h.gameState.PlayerOrder = append(h.gameState.PlayerOrder, id)
+	}
+
+	for id := range h.playerReady {
+		h.playerReady[id] = false
 	}
 
 	h.gameState.DealerIndex = (h.gameState.DealerIndex + 1) % len(h.gameState.PlayerOrder)
@@ -223,224 +236,26 @@ func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
 	log.Printf("First turn is %s", h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex])
 }
 
-func (h *Hub) handleBetUnsafe(playerID string, amount int) {
-	if player, ok := h.gameState.Players[playerID]; ok {
-		actualAmount := amount
-		if player.Chips < amount {
-			actualAmount = player.Chips // All-in
-		}
-		player.Chips -= actualAmount
-		player.Bet += actualAmount
-		// h.gameState.Pot += actualAmount // Tiền sẽ được gom vào pot cuối vòng
-		h.gameState.Players[playerID] = player
-	}
-}
-
-// --- Xử lý hành động người chơi ---
-
-type PlayerActionPayload struct {
-	Action string `json:"action"`
-	Amount int    `json:"amount"`
-}
-
-func (h *Hub) handlePlayerAction(playerID string, payloadBytes json.RawMessage) {
-	h.gameStateMutex.Lock()
-	defer h.gameStateMutex.Unlock()
-
-	if !h.gameState.GameStarted || len(h.gameState.PlayerOrder) == 0 || h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex] != playerID {
-		log.Printf("Action from %s rejected: not their turn.", playerID)
-		return
-	}
-
-	var payload PlayerActionPayload
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		log.Printf("Error unmarshalling action payload: %v", err)
-		return
-	}
-
-	log.Printf("Player %s action: %s (Amount: %d)", playerID, payload.Action, payload.Amount)
-
-	player := h.gameState.Players[playerID]
-
-	switch payload.Action {
-	case "fold":
-		player.IsInHand = false
-		h.gameState.Players[playerID] = player
-	case "check":
-		if player.Bet < h.gameState.LastBet {
-			log.Printf("Player %s invalid check rejected.", playerID)
-			return
-		}
-	case "call":
-		amountToCall := h.gameState.LastBet - player.Bet
-		h.handleBetUnsafe(playerID, amountToCall)
-	case "raise":
-		totalBet := payload.Amount
-		if totalBet < h.gameState.LastBet*2 { // Logic raise tối thiểu
-			log.Printf("Player %s invalid raise rejected. Amount too small.", playerID)
-			return
-		}
-		amountToBet := totalBet - player.Bet
-		h.handleBetUnsafe(playerID, amountToBet)
-		h.gameState.LastBet = totalBet
-	}
-
-	h.advanceTurnUnsafe()
-	h.broadcastGameState()
-}
-
-func (h *Hub) advanceTurnUnsafe() {
-	playersInHandCount := 0
-	var lastPlayerInHandID string
-	for _, id := range h.gameState.PlayerOrder {
-		if h.gameState.Players[id].IsInHand {
-			playersInHandCount++
-			lastPlayerInHandID = id
-		}
-	}
-	if playersInHandCount <= 1 {
-		h.awardPotUnsafe(lastPlayerInHandID)
-		h.endGameUnsafe(lastPlayerInHandID + " wins by default!")
-		return
-	}
-
-	// Kiểm tra xem vòng cược đã kết thúc chưa
-	roundOver := true
-	playersAllInCount := 0
-	activePlayerCount := 0
-	for _, id := range h.gameState.PlayerOrder {
-		p := h.gameState.Players[id]
-		if p.IsInHand {
-			activePlayerCount++
-			if p.Chips == 0 {
-				playersAllInCount++
-			} else if p.Bet < h.gameState.LastBet {
-				roundOver = false
-			}
-		}
-	}
-	// Nếu tất cả người còn lại đều đã all-in hoặc đã cược bằng nhau
-	if activePlayerCount == playersAllInCount {
-		roundOver = true
-	}
-
-	if roundOver {
-		log.Printf("--- BETTING ROUND ENDED (%s) ---", h.gameState.GamePhase)
-		h.startNextPhaseUnsafe()
-		return
-	}
-
-	// Tìm người chơi tiếp theo
-	startTurnIndex := h.gameState.CurrentTurnIndex
-	for i := 0; i < len(h.gameState.PlayerOrder); i++ {
-		h.gameState.CurrentTurnIndex = (startTurnIndex + 1 + i) % len(h.gameState.PlayerOrder)
-		nextPlayerID := h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex]
-		nextPlayer := h.gameState.Players[nextPlayerID]
-		if nextPlayer.IsInHand && nextPlayer.Chips > 0 {
-			log.Printf("Next turn is %s", h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex])
-			return // Tìm thấy người chơi tiếp theo
-		}
-	}
-}
-
-func (h *Hub) startNextPhaseUnsafe() {
-	h.gameState.Pot += h.collectBetsUnsafe()
-
-	// Nếu chỉ còn 1 người, họ thắng
-	playersInHandCount := 0
-	var lastPlayerInHandID string
-	for _, id := range h.gameState.PlayerOrder {
-		if h.gameState.Players[id].IsInHand {
-			playersInHandCount++
-			lastPlayerInHandID = id
-		}
-	}
-	if playersInHandCount <= 1 {
-		h.awardPotUnsafe(lastPlayerInHandID)
-		h.endGameUnsafe(lastPlayerInHandID + " wins!")
-		return
-	}
-
-	switch h.gameState.GamePhase {
-	case "pre-flop":
-		h.gameState.GamePhase = "flop"
-		log.Println("--- STARTING FLOP ---")
-		h.dealCommunityCardsUnsafe(3)
-	case "flop":
-		h.gameState.GamePhase = "turn"
-		log.Println("--- STARTING TURN ---")
-		h.dealCommunityCardsUnsafe(1)
-	case "turn":
-		h.gameState.GamePhase = "river"
-		log.Println("--- STARTING RIVER ---")
-		h.dealCommunityCardsUnsafe(1)
-	case "river":
-		h.gameState.GamePhase = "showdown"
-		log.Println("--- STARTING SHOWDOWN ---")
-		// TODO: Logic so bài
-		h.endGameUnsafe("Showdown!")
-		return
-	}
-
-	h.gameState.LastBet = 0
-	h.gameState.CurrentTurnIndex = h.gameState.DealerIndex
-	for i := 0; i < len(h.gameState.PlayerOrder); i++ {
-		h.gameState.CurrentTurnIndex = (h.gameState.CurrentTurnIndex + 1) % len(h.gameState.PlayerOrder)
-		playerID := h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex]
-		if h.gameState.Players[playerID].IsInHand {
-			break
-		}
-	}
-}
-
-func (h *Hub) dealCommunityCardsUnsafe(count int) {
-	if len(h.gameState.Deck) > 0 { // Burn 1 card
-		h.gameState.Deck = h.gameState.Deck[1:]
-	}
-	if len(h.gameState.Deck) >= count {
-		h.gameState.CommunityCards = append(h.gameState.CommunityCards, h.gameState.Deck[:count]...)
-		h.gameState.Deck = h.gameState.Deck[count:]
-	}
-}
-
-func (h *Hub) collectBetsUnsafe() int {
-	collected := 0
-	for id, p := range h.gameState.Players {
-		collected += p.Bet
-		p.Bet = 0
-		h.gameState.Players[id] = p
-	}
-	return collected
-}
-
-func (h *Hub) awardPotUnsafe(winnerID string) {
-	if winnerID != "" {
-		h.gameState.Pot += h.collectBetsUnsafe()
-		winner := h.gameState.Players[winnerID]
-		winner.Chips += h.gameState.Pot
-		h.gameState.Players[winnerID] = winner
-		log.Printf("Awarded pot of %d to %s", h.gameState.Pot, winnerID)
-		h.gameState.Pot = 0
-	}
-}
-
 func (h *Hub) endGameUnsafe(reason string) {
 	log.Printf("--- GAME ENDED: %s ---", reason)
 	h.gameState.GameStarted = false
 	h.gameState.GamePhase = "waiting"
+
 	for id, p := range h.gameState.Players {
-		p.IsReady = false
 		p.Hand = []Card{}
 		p.Bet = 0
+		p.IsInHand = false
 		h.gameState.Players[id] = p
 	}
 	h.gameState.CommunityCards = []Card{}
 	h.gameState.Pot = 0
 }
 
-func (h *Hub) broadcastGameState() {
-	h.gameStateMutex.RLock()
-	defer h.gameStateMutex.RUnlock()
+// broadcastGameStateUnsafe sends the current game state to all connected clients.
+// It assumes the caller is holding a lock on gameStateMutex.
+func (h *Hub) broadcastGameStateUnsafe() {
+	h.gameState.PlayerReady = h.playerReady
+
 	payload, err := json.Marshal(h.gameState)
 	if err != nil {
 		log.Printf("Error marshalling state: %v", err)
@@ -462,7 +277,200 @@ func (h *Hub) broadcastGameState() {
 	}
 }
 
-// --- Xử lý kết nối của Client ---
+// --- Functions below this line are mostly unchanged ---
+
+func (h *Hub) handleBetUnsafe(playerID string, amount int) {
+	if player, ok := h.gameState.Players[playerID]; ok {
+		actualAmount := amount
+		if player.Chips < amount {
+			actualAmount = player.Chips // All-in
+		}
+		player.Chips -= actualAmount
+		player.Bet += actualAmount
+		h.gameState.Players[playerID] = player
+	}
+}
+
+type PlayerActionPayload struct {
+	Action string `json:"action"`
+	Amount int    `json:"amount"`
+}
+
+func (h *Hub) handlePlayerAction(playerID string, payloadBytes json.RawMessage) {
+	h.gameStateMutex.Lock()
+	defer h.gameStateMutex.Unlock()
+
+	if !h.gameState.GameStarted || len(h.gameState.PlayerOrder) == 0 || h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex] != playerID {
+		return
+	}
+
+	var payload PlayerActionPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		log.Printf("Error unmarshalling action payload: %v", err)
+		return
+	}
+
+	log.Printf("Player %s action: %s (Amount: %d)", playerID, payload.Action, payload.Amount)
+
+	player := h.gameState.Players[playerID]
+
+	switch payload.Action {
+	case "fold":
+		player.IsInHand = false
+		h.gameState.Players[playerID] = player
+	case "check":
+		if player.Bet < h.gameState.LastBet {
+			return
+		}
+	case "call":
+		amountToCall := h.gameState.LastBet - player.Bet
+		h.handleBetUnsafe(playerID, amountToCall)
+	case "raise":
+		totalBet := payload.Amount
+		if totalBet < h.gameState.LastBet*2 {
+			return
+		}
+		amountToBet := totalBet - player.Bet
+		h.handleBetUnsafe(playerID, amountToBet)
+		h.gameState.LastBet = totalBet
+	}
+
+	h.advanceTurnUnsafe()
+}
+
+func (h *Hub) advanceTurnUnsafe() {
+	playersInHandCount := 0
+	var lastPlayerInHandID string
+	for _, id := range h.gameState.PlayerOrder {
+		p := h.gameState.Players[id]
+		if p.IsInHand && p.IsConnected {
+			playersInHandCount++
+			lastPlayerInHandID = id
+		}
+	}
+	if playersInHandCount <= 1 {
+		h.awardPotUnsafe(lastPlayerInHandID)
+		h.endGameUnsafe(lastPlayerInHandID + " wins by default!")
+		h.broadcastGameStateUnsafe()
+		return
+	}
+
+	roundOver := true
+	playersAllInCount := 0
+	activePlayerCount := 0
+	for _, id := range h.gameState.PlayerOrder {
+		p := h.gameState.Players[id]
+		if p.IsInHand && p.IsConnected {
+			activePlayerCount++
+			if p.Chips == 0 {
+				playersAllInCount++
+			} else if p.Bet < h.gameState.LastBet {
+				roundOver = false
+			}
+		}
+	}
+	if activePlayerCount > 0 && activePlayerCount == playersAllInCount {
+		roundOver = true
+	}
+
+	if roundOver {
+		log.Printf("--- BETTING ROUND ENDED (%s) ---", h.gameState.GamePhase)
+		h.startNextPhaseUnsafe()
+		return
+	}
+
+	startTurnIndex := h.gameState.CurrentTurnIndex
+	for i := 0; i < len(h.gameState.PlayerOrder); i++ {
+		h.gameState.CurrentTurnIndex = (startTurnIndex + 1 + i) % len(h.gameState.PlayerOrder)
+		nextPlayerID := h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex]
+		if player, ok := h.gameState.Players[nextPlayerID]; ok {
+			if player.IsInHand && player.Chips > 0 && player.IsConnected {
+				log.Printf("Next turn is %s", h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex])
+				h.broadcastGameStateUnsafe()
+				return
+			}
+		}
+	}
+}
+
+func (h *Hub) startNextPhaseUnsafe() {
+	h.gameState.Pot += h.collectBetsUnsafe()
+
+	playersInHandCount := 0
+	var lastPlayerInHandID string
+	for _, id := range h.gameState.PlayerOrder {
+		p := h.gameState.Players[id]
+		if p.IsInHand && p.IsConnected {
+			playersInHandCount++
+			lastPlayerInHandID = id
+		}
+	}
+	if playersInHandCount <= 1 {
+		h.awardPotUnsafe(lastPlayerInHandID)
+		h.endGameUnsafe(lastPlayerInHandID + " wins!")
+		return
+	}
+
+	switch h.gameState.GamePhase {
+	case "pre-flop":
+		h.gameState.GamePhase = "flop"
+		h.dealCommunityCardsUnsafe(3)
+	case "flop":
+		h.gameState.GamePhase = "turn"
+		h.dealCommunityCardsUnsafe(1)
+	case "turn":
+		h.gameState.GamePhase = "river"
+		h.dealCommunityCardsUnsafe(1)
+	case "river":
+		h.gameState.GamePhase = "showdown"
+		h.endGameUnsafe("Showdown!")
+		return
+	}
+
+	h.gameState.LastBet = 0
+	h.gameState.CurrentTurnIndex = h.gameState.DealerIndex
+	for i := 0; i < len(h.gameState.PlayerOrder); i++ {
+		h.gameState.CurrentTurnIndex = (h.gameState.CurrentTurnIndex + 1) % len(h.gameState.PlayerOrder)
+		playerID := h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex]
+		p := h.gameState.Players[playerID]
+		if p.IsInHand && p.IsConnected {
+			break
+		}
+	}
+}
+
+func (h *Hub) dealCommunityCardsUnsafe(count int) {
+	if len(h.gameState.Deck) > 1 {
+		h.gameState.Deck = h.gameState.Deck[1:]
+	}
+	if len(h.gameState.Deck) >= count {
+		h.gameState.CommunityCards = append(h.gameState.CommunityCards, h.gameState.Deck[:count]...)
+		h.gameState.Deck = h.gameState.Deck[count:]
+	}
+}
+
+func (h *Hub) collectBetsUnsafe() int {
+	collected := 0
+	for id, p := range h.gameState.Players {
+		collected += p.Bet
+		p.Bet = 0
+		h.gameState.Players[id] = p
+	}
+	return collected
+}
+
+func (h *Hub) awardPotUnsafe(winnerID string) {
+	if winnerID != "" {
+		h.gameState.Pot += h.collectBetsUnsafe()
+		if winner, ok := h.gameState.Players[winnerID]; ok {
+			winner.Chips += h.gameState.Pot
+			h.gameState.Players[winnerID] = winner
+			log.Printf("Awarded pot of %d to %s", h.gameState.Pot, winnerID)
+			h.gameState.Pot = 0
+		}
+	}
+}
+
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func (c *Client) readPump() {
@@ -473,6 +481,9 @@ func (c *Client) readPump() {
 	for {
 		_, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
 			break
 		}
 		var msg Message
@@ -524,7 +535,6 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	go client.readPump()
 }
 
-// --- Hàm Main ---
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	hub := newHub()
