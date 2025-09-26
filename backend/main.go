@@ -133,6 +133,21 @@ func (h *Hub) run() {
 		select {
 		case client := <-h.register:
 			h.clients[client.ID] = client
+			
+			// Send player ID to the client
+			playerIDMsg := Message{
+				Type: "player_id",
+				Payload: json.RawMessage(fmt.Sprintf(`{"id":"%s"}`, client.ID)),
+			}
+			if msgBytes, err := json.Marshal(playerIDMsg); err == nil {
+				select {
+				case client.send <- msgBytes:
+				default:
+					close(client.send)
+					delete(h.clients, client.ID)
+				}
+			}
+			
 			h.addOrUpdatePlayer(client.ID, true)
 		case client := <-h.unregister:
 			if _, ok := h.clients[client.ID]; ok {

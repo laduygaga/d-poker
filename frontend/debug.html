@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>D-Poker Action Button Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #2c3e50;
+            color: white;
+        }
+        .test-section {
+            background: #34495e;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+        }
+        button {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        #status {
+            background: #2c3e50;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>🃏 D-Poker Action Button Debug Tool</h1>
+    
+    <div class="test-section">
+        <h2>🔧 Debug Controls</h2>
+        <button onclick="testConnection()">Test Connection</button>
+        <button onclick="showActionButtons()">Force Show Action Buttons</button>
+        <button onclick="testPlayerID()">Test Player ID</button>
+        <button onclick="simulateGameState()">Simulate Game State</button>
+    </div>
+    
+    <div class="test-section">
+        <h2>📊 Status</h2>
+        <div id="status">Ready to test...</div>
+    </div>
+    
+    <div class="test-section">
+        <h2>🎮 Actual Game (Embedded)</h2>
+        <iframe src="/" width="100%" height="600" style="border: 2px solid #3498db; border-radius: 8px;"></iframe>
+    </div>
+
+    <script>
+        let ws = null;
+        let playerID = null;
+
+        function log(message) {
+            const status = document.getElementById('status');
+            const timestamp = new Date().toLocaleTimeString();
+            status.innerHTML += `<div>[${timestamp}] ${message}</div>`;
+            status.scrollTop = status.scrollHeight;
+        }
+
+        function testConnection() {
+            log('🔌 Testing connection to ws://localhost:8080/ws...');
+            
+            if (ws) {
+                ws.close();
+            }
+            
+            ws = new WebSocket('ws://localhost:8080/ws');
+            
+            ws.onopen = () => {
+                log('✅ Connected successfully!');
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    log(`📨 Received: ${JSON.stringify(msg, null, 2)}`);
+                    
+                    if (msg.type === 'player_id') {
+                        playerID = msg.payload.id;
+                        log(`🆔 Player ID set: ${playerID}`);
+                    }
+                } catch (error) {
+                    log(`❌ Error parsing message: ${error}`);
+                }
+            };
+            
+            ws.onerror = () => {
+                log('❌ Connection error!');
+            };
+            
+            ws.onclose = () => {
+                log('🔌 Connection closed');
+            };
+        }
+
+        function showActionButtons() {
+            log('🎮 Attempting to show action buttons...');
+            const iframe = document.querySelector('iframe');
+            if (iframe) {
+                try {
+                    // Try to access the game instance
+                    iframe.contentWindow.postMessage({
+                        type: 'showActionButtons'
+                    }, '*');
+                    log('📤 Sent showActionButtons message to iframe');
+                } catch (error) {
+                    log(`❌ Error accessing iframe: ${error}`);
+                }
+            }
+        }
+
+        function testPlayerID() {
+            log('🆔 Testing player ID assignment...');
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'player_join',
+                    payload: { name: 'TestPlayer' }
+                }));
+                log('📤 Sent player_join message');
+            } else {
+                log('❌ WebSocket not connected. Click "Test Connection" first.');
+            }
+        }
+
+        function simulateGameState() {
+            log('🎲 Simulating game state...');
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Send ready message
+                ws.send(JSON.stringify({
+                    type: 'player_ready',
+                    payload: { isReady: true }
+                }));
+                log('📤 Sent player_ready message');
+            } else {
+                log('❌ WebSocket not connected. Click "Test Connection" first.');
+            }
+        }
+
+        // Listen for messages from iframe
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'debug') {
+                log(`🎮 Game Debug: ${event.data.message}`);
+            }
+        });
+
+        // Auto-connect on page load
+        window.onload = () => {
+            setTimeout(testConnection, 500);
+        };
+    </script>
+</body>
+</html>
