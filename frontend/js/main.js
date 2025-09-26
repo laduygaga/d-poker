@@ -3,9 +3,12 @@ class GameScene extends Phaser.Scene {
         super({ key: 'GameScene' });
         this.playerObjects = {}; // Stores game objects for players
         this.communityCardObjects = []; // Stores community card objects
+        this.cardPool = []; // Pool for reusing card objects
         this.isReady = false; // Local flag for immediate UI feedback
         this.myId = null; // ID for this client
         this.gameState = {}; // Holds the latest game state from the server
+        this.reconnectAttempts = 0; // Track reconnection attempts
+        this.playerName = ''; // Player's chosen name
     }
 
     create() {
@@ -14,8 +17,10 @@ class GameScene extends Phaser.Scene {
         this.potText = this.add.text(400, 280, 'Pot: 0', { fontSize: '28px', fill: '#ffc300' }).setOrigin(0.5);
         this.communityCardContainer = this.add.container(400, 220);
 
+        // Player name input
+        this.createNameInput();
+
         // --- New Game Result Text ---
-        // This will display the winner and is hidden by default.
         this.gameResultText = this.add.text(400, 350, '', {
             fontSize: '32px',
             fill: '#00ff00',
@@ -24,6 +29,8 @@ class GameScene extends Phaser.Scene {
             align: 'center'
         }).setOrigin(0.5).setDepth(100).setVisible(false);
 
+        // Chat system
+        this.createChatSystem();
 
         // --- Ready Button ---
         this.readyButton = this.add.text(700, 550, 'Ready', {
@@ -32,43 +39,134 @@ class GameScene extends Phaser.Scene {
         }).setOrigin(0.5).setInteractive();
 
         this.readyButton.on('pointerdown', () => {
+            if (!this.playerName) {
+                this.statusText.setText('Please enter your name first!');
+                return;
+            }
             this.isReady = !this.isReady;
             this.updateReadyButton();
-            this.socket.send(JSON.stringify({ type: 'player_ready', payload: { isReady: this.isReady } }));
+            this.sendMessage({ type: 'player_ready', payload: { isReady: this.isReady } });
         });
         
         // --- In-Game Action Buttons ---
+        this.createActionButtons();
+
+        // --- WebSocket Logic with Reconnection ---
+        this.connectToServer();
+    }
+    
+    createNameInput() {
+        this.nameText = this.add.text(100, 100, 'Enter your name:', { fontSize: '18px', fill: '#fff' });
+        this.nameInputPrompt = this.add.text(100, 130, 'Click here to set name', { 
+            fontSize: '16px', 
+            fill: '#ffc300', 
+            backgroundColor: '#333',
+            padding: { x: 10, y: 5 }
+        }).setInteractive();
+        
+        this.nameInputPrompt.on('pointerdown', () => {
+            const name = prompt('Enter your name:', this.playerName || 'Player');
+            if (name && name.trim()) {
+                this.playerName = name.trim();
+                this.nameInputPrompt.setText(`Name: ${this.playerName}`);
+                this.sendMessage({ type: 'player_join', payload: { name: this.playerName } });
+            }
+        });
+    }
+    
+    createChatSystem() {
+        // Chat display area
+        this.chatContainer = this.add.container(50, 300);
+        this.chatBackground = this.add.rectangle(0, 0, 300, 200, 0x000000, 0.7).setOrigin(0);
+        this.chatContainer.add(this.chatBackground);
+        
+        this.chatMessages = [];
+        this.maxChatMessages = 8;
+        
+        // Chat input
+        this.chatInputPrompt = this.add.text(50, 520, 'Click to chat', { 
+            fontSize: '14px', 
+            fill: '#aaa', 
+            backgroundColor: '#333',
+            padding: { x: 5, y: 3 }
+        }).setInteractive();
+        
+        this.chatInputPrompt.on('pointerdown', () => {
+            const message = prompt('Enter message:');
+            if (message && message.trim()) {
+                this.sendMessage({ type: 'chat_message', payload: { message: message.trim() } });
+            }
+        });
+    }
+    
+    createActionButtons() {
         this.actionContainer = this.add.container(400, 550);
-        const foldButton = this.add.text(-150, 0, 'Fold', { fontSize: '28px', fill: '#ff5733', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
-        const callButton = this.add.text(0, 0, 'Call', { fontSize: '28px', fill: '#33ff57', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
-        const raiseButton = this.add.text(150, 0, 'Raise', { fontSize: '28px', fill: '#3375ff', backgroundColor: '#555', padding: {x: 10, y: 5} }).setOrigin(0.5).setInteractive();
+        const foldButton = this.add.text(-150, 0, 'Fold', { 
+            fontSize: '24px', 
+            fill: '#ff5733', 
+            backgroundColor: '#555', 
+            padding: {x: 10, y: 5} 
+        }).setOrigin(0.5).setInteractive();
+        
+        const callButton = this.add.text(0, 0, 'Call', { 
+            fontSize: '24px', 
+            fill: '#33ff57', 
+            backgroundColor: '#555', 
+            padding: {x: 10, y: 5} 
+        }).setOrigin(0.5).setInteractive();
+        
+        const raiseButton = this.add.text(150, 0, 'Raise', { 
+            fontSize: '24px', 
+            fill: '#3375ff', 
+            backgroundColor: '#555', 
+            padding: {x: 10, y: 5} 
+        }).setOrigin(0.5).setInteractive();
         
         this.actionContainer.add([foldButton, callButton, raiseButton]);
         this.actionContainer.setVisible(false);
 
         foldButton.on('pointerdown', () => this.sendPlayerAction('fold'));
         callButton.on('pointerdown', () => {
-            const action = this.callButton.text === 'Check' ? 'check' : 'call';
+            const action = callButton.text === 'Check' ? 'check' : 'call';
             this.sendPlayerAction(action);
         });
         raiseButton.on('pointerdown', () => {
+            if (!this.gameState.players || !this.gameState.players[this.myId]) return;
+            
             const me = this.gameState.players[this.myId];
-            const minRaise = this.gameState.lastBet * 2 || 20; // Default to Big Blind if no bet
-            const raiseAmount = parseInt(prompt(`Raise amount (min ${minRaise}):`, minRaise), 10);
-            if (!isNaN(raiseAmount) && raiseAmount >= minRaise && raiseAmount <= me.chips) {
+            const callAmount = this.gameState.lastBet - me.bet;
+            const minRaise = this.gameState.lastBet + (this.gameState.minRaise || 20);
+            const maxRaise = me.chips + me.bet; // Total chips available
+            
+            const raiseAmount = parseInt(prompt(`Raise to amount (min ${minRaise}, max ${maxRaise}):`, minRaise), 10);
+            if (!isNaN(raiseAmount) && raiseAmount >= minRaise && raiseAmount <= maxRaise) {
                 this.sendPlayerAction('raise', { amount: raiseAmount });
             } else {
-                alert(`Invalid raise amount. Must be between ${minRaise} and your chip count of ${me.chips}.`);
+                alert(`Invalid raise amount. Must be between ${minRaise} and ${maxRaise}.`);
             }
         });
+        
         this.callButton = callButton;
-
-
-        // --- WebSocket Logic ---
+    }
+    
+    connectToServer() {
+        this.statusText.setText('Connecting...');
         this.socket = new WebSocket('ws://localhost:8080/ws');
-        this.socket.onopen = () => this.statusText.setText('Connected!');
-        this.socket.onerror = (error) => this.statusText.setText('Connection Error!');
-        this.socket.onclose = () => this.statusText.setText('Connection Closed.');
+        
+        this.socket.onopen = () => {
+            this.statusText.setText('Connected!');
+            this.reconnectAttempts = 0;
+        };
+        
+        this.socket.onerror = (error) => {
+            this.statusText.setText('Connection Error!');
+            console.error('WebSocket error:', error);
+        };
+        
+        this.socket.onclose = (event) => {
+            this.statusText.setText('Connection Closed. Reconnecting...');
+            this.scheduleReconnect();
+        };
 
         this.socket.onmessage = (event) => {
             const message = JSON.parse(event.data);
@@ -84,14 +182,48 @@ class GameScene extends Phaser.Scene {
         };
     }
     
+    scheduleReconnect() {
+        if (!this.reconnectAttempts) this.reconnectAttempts = 0;
+        if (this.reconnectAttempts < 10) {
+            const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff
+            this.reconnectAttempts++;
+            setTimeout(() => this.connectToServer(), delay);
+        } else {
+            this.statusText.setText('Connection Failed. Please refresh the page.');
+        }
+    }
+    
+    sendMessage(message) {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify(message));
+        } else {
+            console.warn('WebSocket not connected, message queued');
+            // Could implement message queuing here
+        }
+    }
+    
     sendPlayerAction(action, payload = {}) {
-        this.socket.send(JSON.stringify({ type: 'player_action', payload: { action, ...payload } }));
+        this.sendMessage({ type: 'player_action', payload: { action, ...payload } });
         this.actionContainer.setVisible(false);
     }
 
     updateReadyButton() {
         this.readyButton.setText(this.isReady ? 'Cancel' : 'Ready');
         this.readyButton.setStyle({ fill: this.isReady ? '#ff0' : '#0f0' });
+    }
+
+    getCardFromPool() {
+        if (this.cardPool.length > 0) {
+            return this.cardPool.pop();
+        }
+        return this.add.text(0, 0, '', { 
+            fontSize: '24px', fill: '#000', backgroundColor: '#fff', padding: 8 
+        }).setOrigin(0.5);
+    }
+    
+    returnCardToPool(card) {
+        card.setVisible(false);
+        this.cardPool.push(card);
     }
 
     updateGameState(state) {
@@ -104,15 +236,17 @@ class GameScene extends Phaser.Scene {
         
         this.potText.setText(`Pot: ${state.pot || 0}`);
 
-        this.communityCardObjects.forEach(card => card.destroy());
+        // Return old cards to pool instead of destroying
+        this.communityCardObjects.forEach(card => this.returnCardToPool(card));
         this.communityCardObjects = [];
         if (state.communityCards) {
             let startX = -(state.communityCards.length - 1) * 35;
             state.communityCards.forEach((card, index) => {
                 const cardText = `${card.rank}${card.suit}`;
-                const cardObj = this.add.text(startX + index * 70, 0, cardText, { 
-                    fontSize: '24px', fill: '#000', backgroundColor: '#fff', padding: 8 
-                }).setOrigin(0.5);
+                const cardObj = this.getCardFromPool();
+                cardObj.setText(cardText);
+                cardObj.setPosition(startX + index * 70, 0);
+                cardObj.setVisible(true);
                 this.communityCardContainer.add(cardObj);
                 this.communityCardObjects.push(cardObj);
             });
@@ -172,6 +306,41 @@ class GameScene extends Phaser.Scene {
                 this.callButton.setText(`Call ${state.lastBet - me.bet}`);
             }
         }
+
+        // Update chat messages
+        this.updateChatMessages(state.chatMessages);
+    }
+
+    updateChatMessages(messages) {
+        if (!messages) return;
+        
+        // Clear old messages
+        this.chatMessages.forEach(msg => msg.destroy());
+        this.chatMessages = [];
+        
+        // Show last 8 messages
+        const recentMessages = messages.slice(-this.maxChatMessages);
+        recentMessages.forEach((msg, index) => {
+            let displayText;
+            let color = '#fff';
+            
+            if (msg.playerId === 'system') {
+                displayText = `*** ${msg.message} ***`;
+                color = '#ffff00'; // Yellow for system messages
+            } else {
+                const playerName = this.gameState.players && this.gameState.players[msg.playerId] ? 
+                                 this.gameState.players[msg.playerId].name : 'Player';
+                displayText = `${playerName}: ${msg.message}`;
+            }
+            
+            const text = this.add.text(10, 10 + index * 20, displayText, {
+                fontSize: '12px',
+                fill: color,
+                wordWrap: { width: 280 }
+            });
+            this.chatContainer.add(text);
+            this.chatMessages.push(text);
+        });
     }
 
     renderPlayer(player, position, state) {
@@ -188,11 +357,14 @@ class GameScene extends Phaser.Scene {
                 if (pIndex === (state.dealerIndex + 1) % state.playerOrder.length) statusIcons += ' (SB)';
                 if (pIndex === (state.dealerIndex + 2) % state.playerOrder.length) statusIcons += ' (BB)';
             }
+            if (player.isAllIn) statusIcons += ' (ALL-IN)';
+            if (!player.isInHand) statusIcons += ' (FOLDED)';
         } else if (state.playerReady && state.playerReady[playerId]) {
              statusIcons += ' (Ready)';
         }
         
-        const displayText = `${player.id.substring(0, 5)}${statusIcons}\nChips: ${player.chips}\nBet: ${player.bet || 0}`;
+        const playerName = player.name || player.id.substring(0, 8);
+        const displayText = `${playerName}${statusIcons}\nChips: ${player.chips}\nBet: ${player.bet || 0}`;
 
         let playerObj = this.playerObjects[playerId];
 
@@ -207,7 +379,13 @@ class GameScene extends Phaser.Scene {
             playerObj.setPosition(position.x, position.y);
         }
 
-        playerObj.text.setStyle({ fill: isMyTurn ? '#ffff00' : '#fff' });
+        // Color coding: yellow for current turn, red for all-in, gray for folded
+        let textColor = '#fff';
+        if (isMyTurn) textColor = '#ffff00';
+        else if (player.isAllIn) textColor = '#ff6666';
+        else if (!player.isInHand && state.gameStarted) textColor = '#888888';
+        
+        playerObj.text.setStyle({ fill: textColor });
 
         if (playerObj.cards) {
             playerObj.cards.forEach(c => c.destroy());
@@ -217,8 +395,9 @@ class GameScene extends Phaser.Scene {
         if (player.hand && player.hand.length > 0) {
             player.hand.forEach((card, i) => {
                 const cardText = (player.id === this.myId || state.gamePhase === 'showdown') ? `${card.rank}${card.suit}` : '[]';
+                const cardBgColor = player.isInHand ? '#fff' : '#888';
                 const cardObj = this.add.text((i - 0.5) * 60, -50, cardText, { 
-                    fontSize: '20px', fill: '#000', backgroundColor: player.isInHand ? '#fff' : '#888', padding: 5 
+                    fontSize: '20px', fill: '#000', backgroundColor: cardBgColor, padding: 5 
                 }).setOrigin(0.5);
                 playerObj.add(cardObj);
                 playerObj.cards.push(cardObj);

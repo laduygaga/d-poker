@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -19,6 +20,23 @@ const (
 	StartingChips = 1000
 	SmallBlindAmt = 10
 	BigBlindAmt   = 20
+)
+
+// Global deck pool for reusing card objects
+var (
+	deckPool = sync.Pool{
+		New: func() interface{} {
+			suits := []string{"♥", "♦", "♣", "♠"}
+			ranks := []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"}
+			deck := make([]Card, 0, 52)
+			for _, s := range suits {
+				for _, r := range ranks {
+					deck = append(deck, Card{Suit: s, Rank: r})
+				}
+			}
+			return deck
+		},
+	}
 )
 
 // --- Structs cho WebSocket ---
@@ -46,11 +64,14 @@ type Card struct {
 
 type Player struct {
 	ID          string `json:"id"`
+	Name        string `json:"name"`
 	IsConnected bool   `json:"isConnected"`
 	Hand        []Card `json:"hand"`
 	Chips       int    `json:"chips"`
 	Bet         int    `json:"bet"`
 	IsInHand    bool   `json:"isInHand"`
+	IsAllIn     bool   `json:"isAllIn"`
+	HasActed    bool   `json:"hasActed"`
 }
 
 type GameState struct {
@@ -59,14 +80,28 @@ type GameState struct {
 	GameStarted      bool              `json:"gameStarted"`
 	Deck             []Card            `json:"-"`
 	Pot              int               `json:"pot"`
+	SidePots         []SidePot         `json:"sidePots"`
 	PlayerOrder      []string          `json:"playerOrder"`
 	DealerIndex      int               `json:"dealerIndex"`
 	CurrentTurnIndex int               `json:"currentTurnIndex"`
 	GamePhase        string            `json:"gamePhase"`
 	LastBet          int               `json:"lastBet"`
+	MinRaise         int               `json:"minRaise"`
 	CommunityCards   []Card            `json:"communityCards"`
 	WinningHandDesc  string            `json:"winningHandDesc,omitempty"`
+	ChatMessages     []ChatMessage     `json:"chatMessages"`
 	actionToPlayerID string
+}
+
+type SidePot struct {
+	Amount      int      `json:"amount"`
+	EligibleIDs []string `json:"eligibleIds"`
+}
+
+type ChatMessage struct {
+	PlayerID  string    `json:"playerId"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 type Message struct {
@@ -86,6 +121,9 @@ func newHub() *Hub {
 			DealerIndex:    -1,
 			GamePhase:      "waiting",
 			CommunityCards: []Card{},
+			SidePots:       []SidePot{},
+			ChatMessages:   []ChatMessage{},
+			MinRaise:       BigBlindAmt,
 		},
 	}
 }
@@ -107,12 +145,30 @@ func (h *Hub) run() {
 }
 
 func (h *Hub) addOrUpdatePlayer(playerID string, isConnected bool) {
+	h.addOrUpdatePlayerWithName(playerID, isConnected, "")
+}
+
+func (h *Hub) addOrUpdatePlayerWithName(playerID string, isConnected bool, name string) {
 	h.gameStateMutex.Lock()
 	defer h.gameStateMutex.Unlock()
 	player, exists := h.gameState.Players[playerID]
 	if !exists {
-		player = Player{ID: playerID, Hand: []Card{}, Chips: StartingChips}
+		playerName := name
+		if playerName == "" {
+			playerName = "Player-" + playerID[:8] // Default name
+		}
+		player = Player{
+			ID:          playerID, 
+			Name:        playerName,
+			Hand:        []Card{}, 
+			Chips:       StartingChips,
+			IsAllIn:     false,
+			HasActed:    false,
+		}
 		h.playerReady[playerID] = false
+	}
+	if name != "" && name != player.Name {
+		player.Name = name
 	}
 	player.IsConnected = isConnected
 	h.gameState.Players[playerID] = player
@@ -158,6 +214,44 @@ func (h *Hub) handlePlayerReady(playerID string, isReady bool) {
 	h.broadcastGameStateUnsafe()
 }
 
+func (h *Hub) handleChatMessage(playerID string, payloadBytes json.RawMessage) {
+	var payload ChatPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		log.Printf("Error unmarshaling chat payload: %v", err)
+		return
+	}
+	
+	h.gameStateMutex.Lock()
+	defer h.gameStateMutex.Unlock()
+	
+	if player, exists := h.gameState.Players[playerID]; exists {
+		chatMessage := ChatMessage{
+			PlayerID:  playerID,
+			Message:   payload.Message,
+			Timestamp: time.Now(),
+		}
+		h.gameState.ChatMessages = append(h.gameState.ChatMessages, chatMessage)
+		
+		// Keep only last 50 messages
+		if len(h.gameState.ChatMessages) > 50 {
+			h.gameState.ChatMessages = h.gameState.ChatMessages[len(h.gameState.ChatMessages)-50:]
+		}
+		
+		log.Printf("Chat from %s: %s", player.Name, payload.Message)
+		h.broadcastGameStateUnsafe()
+	}
+}
+
+func (h *Hub) handlePlayerJoin(playerID string, payloadBytes json.RawMessage) {
+	var payload PlayerJoinPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		log.Printf("Error unmarshaling player join payload: %v", err)
+		return
+	}
+	
+	h.addOrUpdatePlayerWithName(playerID, true, payload.Name)
+}
+
 func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
 	log.Println("--- GAME STARTING ---")
 	h.gameState.GameStarted = true
@@ -169,23 +263,28 @@ func (h *Hub) startGameUnsafe(activePlayers map[string]Player) {
 	for id := range activePlayers {
 		p := h.gameState.Players[id]
 		p.Hand, p.Bet, p.IsInHand = []Card{}, 0, true
+		p.IsAllIn = false
+		p.HasActed = false
 		h.gameState.Players[id] = p
 		h.gameState.PlayerOrder = append(h.gameState.PlayerOrder, id)
 	}
 	for id := range h.playerReady {
 		h.playerReady[id] = false
 	}
+	
+	h.addSystemChatMessage(fmt.Sprintf("Game started with %d players!", len(activePlayers)))
+	
 	h.gameState.DealerIndex = (h.gameState.DealerIndex + 1) % len(h.gameState.PlayerOrder)
-	suits := []string{"♥", "♦", "♣", "♠"}
-	ranks := []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"}
-	deck := make([]Card, 0, 52)
-	for _, s := range suits {
-		for _, r := range ranks {
-			deck = append(deck, Card{Suit: s, Rank: r})
-		}
-	}
-	rand.Shuffle(len(deck), func(i, j int) { deck[i], deck[j] = deck[j], deck[i] })
-	h.gameState.Deck = deck
+	
+	// Use deck pool for better memory management
+	deck := deckPool.Get().([]Card)
+	// Create a copy to avoid modifying the pooled deck
+	gameDeck := make([]Card, len(deck))
+	copy(gameDeck, deck)
+	deckPool.Put(deck) // Return to pool immediately
+	
+	rand.Shuffle(len(gameDeck), func(i, j int) { gameDeck[i], gameDeck[j] = gameDeck[j], gameDeck[i] })
+	h.gameState.Deck = gameDeck
 	for _, id := range h.gameState.PlayerOrder {
 		if len(h.gameState.Deck) > 1 {
 			p := h.gameState.Players[id]
@@ -210,29 +309,75 @@ func (h *Hub) endGameUnsafe(reason string) {
 	log.Printf("--- GAME ENDED: %s ---", reason)
 	h.gameState.GameStarted = false
 	h.gameState.GamePhase = "waiting"
+	
+	// Check for player elimination and reset game state
+	eliminatedPlayers := []string{}
 	for id := range h.gameState.Players {
 		p := h.gameState.Players[id]
 		p.Hand, p.Bet, p.IsInHand = []Card{}, 0, false
+		p.IsAllIn = false
+		p.HasActed = false
+		
+		// Eliminate players with 0 chips
+		if p.Chips <= 0 {
+			eliminatedPlayers = append(eliminatedPlayers, id)
+			log.Printf("Player %s eliminated (no chips remaining)", p.Name)
+		}
+		
 		h.gameState.Players[id] = p
 	}
+	
+	// Remove eliminated players
+	for _, id := range eliminatedPlayers {
+		delete(h.gameState.Players, id)
+		delete(h.playerReady, id)
+	}
+	
 	h.gameState.CommunityCards = []Card{}
+	h.gameState.SidePots = []SidePot{}
 	h.gameState.Pot = 0
+	h.gameState.MinRaise = BigBlindAmt
+	
+	if len(eliminatedPlayers) > 0 {
+		h.addSystemChatMessage(fmt.Sprintf("%d player(s) eliminated", len(eliminatedPlayers)))
+	}
+}
+
+func (h *Hub) addSystemChatMessage(message string) {
+	chatMessage := ChatMessage{
+		PlayerID:  "system",
+		Message:   message,
+		Timestamp: time.Now(),
+	}
+	h.gameState.ChatMessages = append(h.gameState.ChatMessages, chatMessage)
+	
+	// Keep only last 50 messages
+	if len(h.gameState.ChatMessages) > 50 {
+		h.gameState.ChatMessages = h.gameState.ChatMessages[len(h.gameState.ChatMessages)-50:]
+	}
 }
 
 func (h *Hub) broadcastGameStateUnsafe() {
 	h.gameState.PlayerReady = h.playerReady
 	payload, err := json.Marshal(h.gameState)
 	if err != nil {
+		log.Printf("Error marshaling game state: %v", err)
 		return
 	}
 	msg, err := json.Marshal(Message{Type: "game_state", Payload: json.RawMessage(payload)})
 	if err != nil {
+		log.Printf("Error marshaling message: %v", err)
 		return
 	}
+	// Pre-marshal once and reuse for all clients
 	for _, client := range h.clients {
 		select {
 		case client.send <- msg:
 		default:
+			// Client channel is full, close connection
+			log.Printf("Client %s channel full, closing connection", client.ID)
+			close(client.send)
+			delete(h.clients, client.ID)
 		}
 	}
 }
@@ -254,6 +399,14 @@ type PlayerActionPayload struct {
 	Amount int    `json:"amount"`
 }
 
+type ChatPayload struct {
+	Message string `json:"message"`
+}
+
+type PlayerJoinPayload struct {
+	Name string `json:"name"`
+}
+
 func (h *Hub) handlePlayerAction(playerID string, payloadBytes json.RawMessage) {
 	h.gameStateMutex.Lock()
 	defer h.gameStateMutex.Unlock()
@@ -271,42 +424,118 @@ func (h *Hub) handlePlayerAction(playerID string, payloadBytes json.RawMessage) 
 	}
 
 	player := h.gameState.Players[playerID]
+	if player.IsAllIn || !player.IsInHand {
+		return // Player can't act if all-in or folded
+	}
+	
+	player.HasActed = true
 	roundIsOver := false
 
 	switch payload.Action {
 	case "fold":
 		player.IsInHand = false
+		log.Printf("Player %s folded", player.Name)
+		
 	case "check":
 		if player.Bet < h.gameState.LastBet {
-			return
+			return // Can't check if there's a bet to call
 		}
+		log.Printf("Player %s checked", player.Name)
 		if playerID == h.gameState.actionToPlayerID {
 			roundIsOver = true
 		}
+		
 	case "call":
 		amountToCall := h.gameState.LastBet - player.Bet
-		h.handleBetUnsafe(playerID, amountToCall)
-		if playerID == h.gameState.actionToPlayerID {
-			roundIsOver = true
+		if amountToCall <= 0 {
+			// No amount to call, treat as check
+			if playerID == h.gameState.actionToPlayerID {
+				roundIsOver = true
+			}
+		} else {
+			actualCall := amountToCall
+			if player.Chips < amountToCall {
+				actualCall = player.Chips // All-in call
+				player.IsAllIn = true
+			}
+			h.handleBetUnsafe(playerID, actualCall)
+			log.Printf("Player %s called %d (all-in: %v)", player.Name, actualCall, player.IsAllIn)
+			if playerID == h.gameState.actionToPlayerID {
+				roundIsOver = true
+			}
 		}
+		
 	case "raise":
 		totalBet := payload.Amount
 		amountToBet := totalBet - player.Bet
-		if totalBet < h.gameState.LastBet*2 && player.Chips > amountToBet {
-			return
+		
+		// Validate minimum raise
+		minRaise := h.gameState.LastBet + h.gameState.MinRaise
+		if totalBet < minRaise && player.Chips > amountToBet {
+			return // Invalid raise amount
 		}
-		h.handleBetUnsafe(playerID, amountToBet)
-		h.gameState.LastBet = totalBet
+		
+		if player.Chips <= amountToBet {
+			// All-in raise
+			actualBet := player.Chips
+			h.handleBetUnsafe(playerID, actualBet)
+			player.IsAllIn = true
+			log.Printf("Player %s raised all-in with %d", player.Name, player.Bet)
+		} else {
+			h.handleBetUnsafe(playerID, amountToBet)
+			h.gameState.LastBet = totalBet
+			h.gameState.MinRaise = amountToBet // The raise amount, not the difference
+			log.Printf("Player %s raised to %d", player.Name, totalBet)
+		}
 		h.gameState.actionToPlayerID = playerID
+		
+		// Reset HasActed for all players except this one
+		for id, p := range h.gameState.Players {
+			if id != playerID && p.IsInHand && !p.IsAllIn {
+				p.HasActed = false
+				h.gameState.Players[id] = p
+			}
+		}
 	}
 
 	h.gameState.Players[playerID] = player
 
-	if roundIsOver {
+	// Check if round should end
+	if roundIsOver || h.shouldEndRound() {
 		h.startNextPhaseUnsafe()
 	} else {
 		h.advanceTurnUnsafe()
 	}
+}
+
+// Check if the betting round should end
+func (h *Hub) shouldEndRound() bool {
+	playersInHand := 0
+	playersWhoCanAct := 0
+	playersWhoActed := 0
+	
+	for _, p := range h.gameState.Players {
+		if p.IsInHand {
+			playersInHand++
+			if !p.IsAllIn {
+				playersWhoCanAct++
+				// In new betting rounds with no bets, check if player has acted
+				// In rounds with bets, check if player has acted and matched the bet
+				if h.gameState.LastBet == 0 {
+					if p.HasActed {
+						playersWhoActed++
+					}
+				} else {
+					if p.HasActed && p.Bet == h.gameState.LastBet {
+						playersWhoActed++
+					}
+				}
+			}
+		}
+	}
+	
+	// Round ends if only one player left or all who can act have acted and called/checked
+	return playersInHand <= 1 || (playersWhoCanAct > 0 && playersWhoActed == playersWhoCanAct)
 }
 
 func (h *Hub) advanceTurnUnsafe() {
@@ -330,18 +559,25 @@ func (h *Hub) advanceTurnUnsafe() {
 	}
 
 	startTurnIndex := h.gameState.CurrentTurnIndex
+	log.Printf("Advancing turn from index %d", startTurnIndex)
+	
 	for i := 1; i <= len(h.gameState.PlayerOrder); i++ {
 		h.gameState.CurrentTurnIndex = (startTurnIndex + i) % len(h.gameState.PlayerOrder)
 		nextPlayerID := h.gameState.PlayerOrder[h.gameState.CurrentTurnIndex]
 		if player, ok := h.gameState.Players[nextPlayerID]; ok {
-			if player.IsInHand && player.Chips > 0 && player.IsConnected {
+			log.Printf("Checking player %s: InHand=%v, AllIn=%v, Connected=%v", 
+				player.Name, player.IsInHand, player.IsAllIn, player.IsConnected)
+			// Skip all-in players and players not in hand
+			if player.IsInHand && !player.IsAllIn && player.IsConnected {
+				log.Printf("Turn advanced to player %s (index %d)", player.Name, h.gameState.CurrentTurnIndex)
 				h.broadcastGameStateUnsafe()
 				return
 			}
 		}
 	}
 
-	// All remaining players are all-in
+	// All remaining players are all-in or can't act, go to next phase
+	log.Printf("No valid players found for next turn, advancing to next phase")
 	h.startNextPhaseUnsafe()
 }
 
@@ -355,35 +591,30 @@ func (h *Hub) startNextPhaseUnsafe() {
 		return
 	}
 
-	firstPlayerIndex := -1
-	lastPlayerIndex := -1
+	// Reset HasActed for all players for the new betting round
+	for id, p := range h.gameState.Players {
+		if p.IsInHand && !p.IsAllIn {
+			p.HasActed = false
+			h.gameState.Players[id] = p
+			log.Printf("Reset HasActed for player %s", p.Name)
+		}
+	}
 
+	// Find the first player to act (after dealer, but skip all-in and folded players)
+	firstPlayerIndex := -1
 	if len(h.gameState.PlayerOrder) > 0 {
 		for i := 1; i <= len(h.gameState.PlayerOrder); i++ {
 			idx := (h.gameState.DealerIndex + i) % len(h.gameState.PlayerOrder)
 			playerID := h.gameState.PlayerOrder[idx]
-			if p, ok := h.gameState.Players[playerID]; ok && p.IsInHand && p.IsConnected && p.Chips > 0 {
+			if p, ok := h.gameState.Players[playerID]; ok && p.IsInHand && p.IsConnected && !p.IsAllIn {
 				firstPlayerIndex = idx
-				break
-			}
-		}
-
-		for i := 0; i < len(h.gameState.PlayerOrder); i++ {
-			idx := (h.gameState.DealerIndex - i + len(h.gameState.PlayerOrder)) % len(h.gameState.PlayerOrder)
-			playerID := h.gameState.PlayerOrder[idx]
-			if p, ok := h.gameState.Players[playerID]; ok && p.IsInHand && p.IsConnected && p.Chips > 0 {
-				lastPlayerIndex = idx
 				break
 			}
 		}
 	}
 
 	h.gameState.CurrentTurnIndex = firstPlayerIndex
-	if firstPlayerIndex != -1 {
-		h.gameState.actionToPlayerID = h.gameState.PlayerOrder[lastPlayerIndex]
-	} else {
-		h.gameState.actionToPlayerID = ""
-	}
+	h.gameState.actionToPlayerID = "" // Reset action tracking
 
 	switch h.gameState.GamePhase {
 	case "pre-flop":
@@ -397,9 +628,11 @@ func (h *Hub) startNextPhaseUnsafe() {
 		h.dealCommunityCardsUnsafe(1)
 	}
 
-	h.gameState.LastBet = 0
+	h.gameState.LastBet = 0       // Reset betting for new round
+	h.gameState.MinRaise = BigBlindAmt // Reset minimum raise
 
 	if h.gameState.CurrentTurnIndex == -1 {
+		// No players can act (all all-in), go to next phase
 		h.broadcastGameStateUnsafe()
 		time.AfterFunc(1*time.Second, func() {
 			h.gameStateMutex.Lock()
@@ -473,16 +706,29 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
+	
+	// Set read deadline and pong handler
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+	
 	for {
 		_, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				log.Printf("WebSocket error for client %s: %v", c.ID, err)
 			}
 			break
 		}
+		
+		// Reset read deadline on successful message
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		
 		var msg Message
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
+			log.Printf("Invalid message from client %s: %v", c.ID, err)
 			continue
 		}
 		switch msg.Type {
@@ -492,18 +738,46 @@ func (c *Client) readPump() {
 			}
 			if json.Unmarshal(msg.Payload, &payload) == nil {
 				c.hub.handlePlayerReady(c.ID, payload.IsReady)
+			} else {
+				log.Printf("Invalid player_ready payload from client %s", c.ID)
 			}
 		case "player_action":
 			c.hub.handlePlayerAction(c.ID, msg.Payload)
+		case "chat_message":
+			c.hub.handleChatMessage(c.ID, msg.Payload)
+		case "player_join":
+			c.hub.handlePlayerJoin(c.ID, msg.Payload)
+		default:
+			log.Printf("Unknown message type '%s' from client %s", msg.Type, c.ID)
 		}
 	}
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
-	for msg := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			return
+	ticker := time.NewTicker(54 * time.Second) // Ping every 54 seconds
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	
+	for {
+		select {
+		case msg, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Printf("Error writing message to client %s: %v", c.ID, err)
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("Error sending ping to client %s: %v", c.ID, err)
+				return
+			}
 		}
 	}
 }
@@ -528,6 +802,10 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	hub := newHub()
 	go hub.run()
+	
+	// Start performance monitoring
+	hub.startMetricsLogger()
+	
 	http.Handle("/", http.FileServer(http.Dir("../frontend")))
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { serveWs(hub, w, r) })
 	log.Println("Server is running on http://localhost:8080")
